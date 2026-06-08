@@ -1,37 +1,100 @@
 /*
 ===============================================================================
-            ZIGZAG MOTOR CONTROLLER — ONE-VARIABLE S-CURVE
-                   Armed-Sensor Model + Cosine Ramp
+            ZIGZAG MOTOR CONTROLLER — FINAL VERSION
+                    Armed-Sensor Model
+                    Acceleration-Based Cosine S-Curve
+                    Proportional Reversal with Resonance Floor
 ===============================================================================
 
-WHAT'S NEW IN THIS VERSION
+WHAT THIS CODE DOES
 -------------------------------------------------------------------------------
-Tuning is now just ONE knob:
+Drives a stepper motor back-and-forth between two end sensors.
 
-      #define RAMP_TIME_MS  500   ← total accel (or decel) time in milliseconds
+  • ESP32
+  • TB6600 stepper driver
+  • NEMA stepper motor
+  • Two Hall-effect end sensors (LEFT and RIGHT)
 
-No more juggling RAMP_PERCENT, SCURVE_MIN_FACTOR, shape factors, etc.
-Whatever speed you type, the motor takes RAMP_TIME_MS to get there from
-rest, following a smooth cosine S-curve. Decel uses the same time.
+Motion cycle:
 
-WHY IT NO LONGER VIBRATES AT START / STOP
+      [LEFT sensor]  <---- carriage ---->  [RIGHT sensor]
+
+  → carriage cruises toward an end at user speed
+  → sensor at that end trips
+  → motor smoothly DECELERATES to a "reversal speed" (NOT zero)
+  → DIR pin flips WHILE STILL PULSING
+  → motor smoothly ACCELERATES back up to cruise speed
+  → carriage moves to the other end
+  → repeat forever
+
+User types a speed in Hz on Serial Monitor.
+Type 0 to smoothly stop.
+
+
+===============================================================================
+THREE KEY DESIGN DECISIONS
 -------------------------------------------------------------------------------
-The earlier S-curve lingered near 0 Hz at the endpoints — and stepper
-motors physically can't run smoothly below roughly 50–80 Hz. Pulses get
-so far apart that the rotor chatters between detent positions. You hear
-it as a buzz / hum / shudder at the very beginning of motion and the
-very end of a stop.
 
-The fix: skip the resonance zone entirely.
+1) ARMED-SENSOR MODEL
+   ---------------------------------------------------------------------------
+   At any moment, exactly ONE sensor is "armed" — the one at the FAR end.
 
-  • On START :  speed jumps from 0 → MIN_HZ instantly,
-                then S-curve ramps MIN_HZ → target.
-  • On STOP  :  S-curve ramps current → MIN_HZ,
-                then snaps to 0.
+       Moving CW  (→ RIGHT)  →  RIGHT sensor armed
+       Moving CCW (→ LEFT )  →  LEFT  sensor armed
 
-MIN_HZ is internal (defined below). 80 Hz is a safe default for most
-NEMA17 + TB6600 setups. Increase it if your motor still buzzes; decrease
-it for finer low-speed control.
+   The instant a sensor trips, we flag a reversal AND swap the armed sensor.
+   The just-tripped sensor is now disarmed — the carriage can sit on its
+   magnet without re-triggering. No debouncing, no spike rejection,
+   no timed lockouts. Physics does the work.
+
+
+2) ACCELERATION-BASED COSINE S-CURVE
+   ---------------------------------------------------------------------------
+   Tuning knob: ACCEL_HZ_PER_SEC (units: Hz per second = steps/s²)
+
+   Ramp duration is DERIVED from the speed delta:
+
+       duration = Δspeed / acceleration
+
+   This means acceleration FORCE on the mechanics is constant regardless
+   of target speed — the right thing for belts, leadscrews, bearings.
+
+       500 Hz target  →  500 / 8000  = 62 ms ramp
+       4000 Hz target →  4000 / 8000 = 500 ms ramp
+
+   Within each ramp, a cosine curve shapes the speed-vs-time profile:
+
+       p     = elapsed / duration               (0.0 → 1.0)
+       shape = 0.5 × (1 − cos(π × p))           (0 → 1, zero slope at ends)
+       speed = from + (to − from) × shape
+
+   Cosine has ZERO slope at both endpoints — perfectly smooth handoff
+   in and out of every ramp (no jerk = no missed steps).
+
+
+3) PROPORTIONAL REVERSAL WITH RESONANCE FLOOR
+   ---------------------------------------------------------------------------
+   The S-curve's job at reversal is NOT to stop the motor.
+   It's to CUSHION the direction change so the motor doesn't jerk.
+
+   Stopping at 0 Hz drags the motor through its resonance band
+   (~0–300 Hz on NEMA17) where it vibrates and slips. So we don't go there.
+
+   Instead, reversal speed scales with cruise speed:
+
+       reversalHz = cruise × (100 − REVERSAL_PERCENT) / 100
+
+       cruise 2000 →  20% bleed  →  flip DIR at 1600 Hz
+       cruise 1000 →  20% bleed  →  flip DIR at  800 Hz
+
+   But at very low cruise speeds, 20% bleed would put us inside the
+   resonance band. So we clamp:
+
+       if (reversalHz < REVERSAL_FLOOR_HZ) reversalHz = REVERSAL_FLOOR_HZ
+
+   The motor flips DIR while still pulsing above resonance, then ramps
+   back up to cruise. No vibration, no slip, no audible jerk.
+
 
 ===============================================================================
 WIRING
@@ -42,8 +105,9 @@ WIRING
 
   ESP32 GND     ───►  TB6600 PUL-
   ESP32 GND     ───►  TB6600 DIR-      ← make this connection SOLID.
-                                          A loose DIR- = phantom direction
-                                          flips that look like a software bug.
+                                          A loose DIR- causes phantom
+                                          direction flips that look like
+                                          software bugs (lessons learned).
 
   Hall LEFT  OUT  ───►  ESP32 GPIO32
   Hall RIGHT OUT  ───►  ESP32 GPIO22
@@ -54,51 +118,21 @@ WIRING
 
 CRITICAL: ESP32 GND and TB6600 GND must share a common ground.
 
+
 ===============================================================================
 SERIAL MONITOR
 -------------------------------------------------------------------------------
 
-  Baud:  115200
+  Baud: 115200
 
   Type a speed in Hz and press ENTER:
 
-      100     gentle
-      500     medium
-      2000    fast
+      400     gentle
+      1000    medium
+      2500    fast
       4500    very fast
 
   Type 0 to smoothly stop.
-
-===============================================================================
-THE COSINE S-CURVE — HOW IT WORKS
--------------------------------------------------------------------------------
-
-Each ramp interpolates from a START speed to an END speed over RAMP_TIME_MS:
-
-    p     = elapsed / RAMP_TIME_MS                   (progress, 0.0 → 1.0)
-    s     = 0.5 × (1 − cos(π × p))                   (cosine shape, 0 → 1)
-    speed = startSpeed + (endSpeed − startSpeed) × s
-
-Why cosine and not the old 4·p·(1−p)?
-
-  • Cosine has ZERO slope at both ends — perfectly smooth handoff at
-    start and stop. (4·p·(1−p) has a non-zero slope at the endpoints.)
-  • Maximum acceleration sits in the middle of the ramp — easy on the
-    mechanics, easy on the ear.
-  • Time-based parameterization means we don't have to know or compute
-    target-relative shape factors. One math expression covers every case:
-    starting, stopping, mid-flight speed changes.
-
-Profile (illustrative):
-
-   speed
-   target ┤            _____
-          │          ╱
-          │         ╱             ← max accel here (mid-ramp)
-          │       ╱
-   MIN_HZ ┤  ────╱                 ← jump-start out of resonance
-        0 ┤ /
-          └─────────────────────► time
 
 ===============================================================================
 */
@@ -116,51 +150,60 @@ Profile (illustrative):
 
 
 // ============================================================================
-// THE ONE TUNING KNOB
+// TUNING KNOBS
 // ============================================================================
+
+// ---- ACCELERATION ----------------------------------------------------------
+// Constant acceleration rate in Hz per second (i.e. steps/s²).
+// Defines how aggressively the motor changes speed.
 //
-#define ACCEL_HZ_PER_SEC   2000     // acceleration rate (steps/sec²)
-                                    //   2000  → very gentle
-                                    //   8000  → balanced default
-                                    //   20000 → aggressive
+//   2000   →  very gentle      (heavy carriages, fragile mechanics)
+//   8000   →  balanced default
+//   20000  →  aggressive       (light loads, snappy response)
+//
+#define ACCEL_HZ_PER_SEC   4000
+
+// ---- REVERSAL DEPTH --------------------------------------------------------
+// How much of cruise speed to bleed off before flipping DIR.
+//
+//   10  →  small cushion, fast reversal but harder on motor
+//   20  →  balanced default
+//   40  →  large cushion, very smooth but slow reversal
+//
+#define REVERSAL_PERCENT   20
+
+// ---- RESONANCE FLOOR -------------------------------------------------------
+// Minimum speed at which we'll ever flip DIR or start/stop the motor.
+// Stays above the motor's resonance/cogging band.
+//
+//   300   →  good for most NEMA17 (8-step microstepping)
+//   500   →  safer if the motor still vibrates at startup
+//   700+  →  for stubborn high-inertia setups
+//
+#define REVERSAL_FLOOR_HZ  600
 
 
 // ============================================================================
 // INTERNAL CONSTANTS (rarely need changing)
 // ============================================================================
 
-// STEP pulse width in microseconds.
-// TB6600 needs at least ~2 us; 5–15 us is safe.
-#define PULSE_US     10
+// STEP pulse width in microseconds. TB6600 needs ~2 us minimum; 5–15 is safe.
+#define PULSE_US        10
 
-// Settle delay after toggling DIR pin (ms).
-// Lets TB6600 register the new direction before the next pulse.
-#define DIR_SETTLE   15
-
-// Minimum stepper frequency in Hz — below this, the motor enters its
-// resonance/cogging zone and buzzes instead of stepping cleanly.
-// We "jump" past this zone on start, and snap to 0 below it on stop.
-//   60–80   →  good for most NEMA17 setups
-//   100+    →  if your motor still buzzes at startup
-//   30–50   →  if you need finer low-speed control and the motor is happy
-#define MIN_HZ       80
+// Settle delay after toggling DIR pin (microseconds).
+// Lets the TB6600 register the new direction before the next STEP.
+// Short because we flip DIR while spinning — long delay() would stall pulses.
+#define DIR_SETTLE_US   500
 
 // How often the ramp engine recomputes currentSpeed (ms).
-// Smaller = smoother (but more CPU); larger = coarser.
 #define RAMP_UPDATE_MS  5
 
 
 // ============================================================================
-// SENSOR ARMING — picks which end-stop is "live" right now
+// SENSOR ARMING
 // ============================================================================
 //
-// Only the armed sensor can trip the motor. The other is ignored entirely.
-//
-// Moving CW  (→ RIGHT)  →  arm RIGHT sensor
-// Moving CCW (→ LEFT )  →  arm LEFT  sensor
-//
-// After a reversal we swap the armed sensor. The just-tripped sensor is
-// disarmed, so the carriage can sit on its magnet without re-triggering.
+// Identifies which end-stop is currently "live". The other is ignored.
 //
 enum ArmedSensor { ARM_LEFT, ARM_RIGHT };
 
@@ -169,7 +212,7 @@ enum ArmedSensor { ARM_LEFT, ARM_RIGHT };
 // STATE
 // ============================================================================
 
-// User-commanded target speed (Hz). Updated by Serial input.
+// User-commanded target cruise speed (Hz). Updated by Serial input.
 float  targetSpeedUser = 0;
 
 // Live speed used to time STEP pulses (Hz).
@@ -183,24 +226,24 @@ float  stepIntervalUs  = 999999;
 //   false = CCW (DIR LOW)
 bool   direction       = true;
 
-// True while we're ramping DOWN toward a direction flip.
-// handleRamp() sets it false once the flip is complete.
+// True while ramping DOWN toward a sensor-triggered direction reversal.
+// Cleared once the reversal completes.
 bool   reversing       = false;
 
 // Which end sensor is currently watching for an end-of-travel hit.
-ArmedSensor armed      = ARM_RIGHT;     // start CW → expect RIGHT trip first
+ArmedSensor armed      = ARM_RIGHT;     // boot in CW → expect RIGHT trip first
 
 // Cosine ramp bookkeeping — set by beginRamp(), consumed by handleRamp().
-float         rampFromHz     = 0;
-float         rampToHz       = 0;
-unsigned long rampStartTime  = 0;
-unsigned long rampDurationMs = 0;     // derived from speed delta + accel
-bool          ramping        = false;
+float         rampFromHz     = 0;       // speed at start of current ramp
+float         rampToHz       = 0;       // target speed of current ramp
+unsigned long rampStartTime  = 0;       // millis() when this ramp began
+unsigned long rampDurationMs = 0;       // computed from speed delta / accel
+bool          ramping        = false;   // true while a ramp is in progress
 
-// Step pulse timing.
+// STEP pulse timing.
 unsigned long lastStepTime = 0;
 
-// Ramp update timing.
+// Ramp engine update timing.
 unsigned long lastRampTime = 0;
 
 // Serial input buffer.
@@ -219,20 +262,24 @@ void setup()
     pinMode(PIN_STEP, OUTPUT);
     pinMode(PIN_DIR,  OUTPUT);
     digitalWrite(PIN_STEP, LOW);
-    digitalWrite(PIN_DIR,  HIGH);            // boot up in CW
+    digitalWrite(PIN_DIR,  HIGH);          // boot in CW
 
-    // Sensors — idle HIGH via internal pull-up, LOW when magnet present
+    // Sensors — idle HIGH via internal pull-up, LOW when magnet detected
     pinMode(HALL_LEFT,  INPUT_PULLUP);
     pinMode(HALL_RIGHT, INPUT_PULLUP);
 
     Serial.println();
     Serial.println("===========================================");
-    Serial.println(" Zigzag Controller — One-Variable S-Curve");
-    Serial.print  (" Ramp time: ");
-    Serial.print  (" Accel    : ");
+    Serial.println(" Zigzag Controller — Final");
+    Serial.print  (" Accel        : ");
     Serial.print  (ACCEL_HZ_PER_SEC);
     Serial.println(" Hz/s");
-    Serial.println(MIN_HZ);
+    Serial.print  (" Reversal     : ");
+    Serial.print  (REVERSAL_PERCENT);
+    Serial.println("% bleed");
+    Serial.print  (" Floor        : ");
+    Serial.print  (REVERSAL_FLOOR_HZ);
+    Serial.println(" Hz");
     Serial.println(" Enter speed in Hz   (0 = stop)");
     Serial.println("===========================================");
     Serial.println();
@@ -255,41 +302,68 @@ void loop()
 
 
 // ============================================================================
+// COMPUTE REVERSAL SPEED FROM CRUISE SPEED
+// ============================================================================
+//
+// Implements the proportional-with-floor rule:
+//
+//   reversal = max(cruise × (100 − REVERSAL_PERCENT)% , REVERSAL_FLOOR_HZ)
+//
+// Examples (REVERSAL_PERCENT=20, FLOOR=400):
+//
+//   cruise 3000  →  2400 Hz  (proportional)
+//   cruise 1000  →   800 Hz  (proportional)
+//   cruise  500  →   400 Hz  (clamped to floor)
+//   cruise  300  →   300 Hz  (already below floor — no bleed at all)
+//
+float computeReversalHz(float cruise)
+{
+    float rev = cruise * (100.0f - REVERSAL_PERCENT) / 100.0f;
+
+    if (rev < REVERSAL_FLOOR_HZ) rev = REVERSAL_FLOOR_HZ;
+    if (rev > cruise)            rev = cruise;     // edge case: cruise ≤ floor
+
+    return rev;
+}
+
+
+// ============================================================================
 // START A NEW RAMP toward a target Hz
 // ============================================================================
 //
 // Called whenever we want the motor's speed to change:
 //
-//   • user typed a new speed         →  beginRamp(targetSpeedUser)
-//   • user typed 0 (stop)            →  beginRamp(0)
-//   • sensor tripped (start reversal)→  beginRamp(0)        with reversing=true
-//   • reversal completed             →  beginRamp(targetSpeedUser)
+//   • user typed a new speed         → beginRamp(targetSpeedUser)
+//   • user typed 0 (stop)            → beginRamp(0)
+//   • sensor tripped                 → beginRamp(reversalHz)  with reversing=true
+//   • reversal completed             → beginRamp(targetSpeedUser)
 //
-// Handles three special situations:
-//   1) Cold start from 0 → jump-start past resonance (0 → MIN_HZ instantly)
-//   2) Target below MIN_HZ but not zero → clamp up to MIN_HZ
-//   3) From == To → nothing to do
+// Cold-start handling:
+//   If we're stationary (currentSpeed≈0) and asked to go to a non-zero
+//   target, we instantly jump to REVERSAL_FLOOR_HZ first. This skips the
+//   resonance band the same way a reversal does — the motor never tries
+//   to run below the floor (except during a final stop, handled below).
 //
 void beginRamp(float toHz)
 {
-    // Clamp non-zero targets above resonance floor
-    if (toHz > 0 && toHz < MIN_HZ) toHz = MIN_HZ;
+    // Clamp non-zero targets to the resonance floor
+    if (toHz > 0 && toHz < REVERSAL_FLOOR_HZ) toHz = REVERSAL_FLOOR_HZ;
 
-    // Jump-start out of the resonance zone if we're stationary
+    // Jump-start out of the resonance zone if currently stationary
     if (currentSpeed < 1 && toHz > 0)
     {
-        currentSpeed = MIN_HZ;
-        rampFromHz   = MIN_HZ;
+        currentSpeed = REVERSAL_FLOOR_HZ;
+        rampFromHz   = REVERSAL_FLOOR_HZ;
     }
     else
     {
         rampFromHz = currentSpeed;
     }
 
-    rampToHz       = toHz;
-    rampStartTime  = millis();
+    rampToHz      = toHz;
+    rampStartTime = millis();
 
-    // time = Δspeed / acceleration
+    // duration = |Δspeed| / acceleration
     float delta    = fabsf(rampToHz - rampFromHz);
     rampDurationMs = (unsigned long)(delta * 1000.0f / ACCEL_HZ_PER_SEC);
     if (rampDurationMs < 1) rampDurationMs = 1;
@@ -299,11 +373,14 @@ void beginRamp(float toHz)
 
 
 // ============================================================================
-// READ SERIAL INPUT
+// SERIAL INPUT
 // ============================================================================
 //
 // Build a line one character at a time. ENTER commits it.
-// Negative values are treated as 0 (stop).
+// Negative values → 0 (stop).
+//
+// If a reversal is in progress, the new target is stored but not acted on
+// immediately — the reversal will pick it up automatically when complete.
 //
 void readSerial()
 {
@@ -320,10 +397,6 @@ void readSerial()
                 float v = inputText.toFloat();
                 targetSpeedUser = (v < 0) ? 0 : v;
 
-                // If we're NOT in the middle of a reversal, ramp to the
-                // new target right away. If we ARE reversing, the motor
-                // is busy stopping; the new target will be picked up
-                // automatically when the reversal completes.
                 if (!reversing)
                 {
                     beginRamp(targetSpeedUser);
@@ -348,25 +421,23 @@ void readSerial()
 // RAMP ENGINE — cosine S-curve interpolation
 // ============================================================================
 //
-// Each tick:
-//   • Compute progress p ∈ [0, 1] across RAMP_TIME_MS
-//   • currentSpeed = from + (to − from) × 0.5 × (1 − cos(π × p))
-//   • When p reaches 1, ramp is finished
-//   • If decelerating and we slip below MIN_HZ on the way to 0, snap to 0
-//     (avoids the buzz zone)
-//   • If we just reached 0 while reversing → flip direction + swap armed
-//     sensor + kick off the climb-back-up ramp
+// Each tick (every RAMP_UPDATE_MS ms):
+//   • If a ramp is active, advance currentSpeed along the cosine curve
+//   • Snap to 0 when decelerating to a stop and we cross the floor
+//   • When a reversal-decel ramp finishes, flip DIR and start the accel ramp
+//   • Refresh stepIntervalUs from the new currentSpeed
 //
 void handleRamp()
 {
     if (millis() - lastRampTime < RAMP_UPDATE_MS) return;
     lastRampTime = millis();
 
+    // ---- ACTIVE RAMP ------------------------------------------------------
     if (ramping)
     {
         unsigned long elapsed = millis() - rampStartTime;
 
-       if (elapsed >= rampDurationMs)
+        if (elapsed >= rampDurationMs)
         {
             currentSpeed = rampToHz;
             ramping = false;
@@ -377,9 +448,9 @@ void handleRamp()
             float shape = 0.5f * (1.0f - cosf(PI * p));
             float v     = rampFromHz + (rampToHz - rampFromHz) * shape;
 
-            // Decelerating to 0 and we've dropped into the buzz zone?
-            // Snap straight to 0.
-            if (rampToHz <= 0 && v < MIN_HZ)
+            // User-initiated stop: snap to 0 once we drop below the floor.
+            // Avoids dragging the motor through the resonance band at stop.
+            if (rampToHz <= 0 && v < REVERSAL_FLOOR_HZ)
             {
                 currentSpeed = 0;
                 ramping = false;
@@ -391,23 +462,28 @@ void handleRamp()
         }
     }
 
-    // Reversal completion — speed hit 0 while reversing flag is up
-    if (reversing && currentSpeed <= 0 && !ramping)
+    // ---- REVERSAL HANDOFF -------------------------------------------------
+    // Decel ramp finished — currentSpeed is now at the reversal speed,
+    // safely above resonance. Flip DIR while still pulsing, swap the
+    // armed sensor, then kick off the accel ramp back up to cruise.
+    if (reversing && !ramping)
     {
         direction = !direction;
         digitalWrite(PIN_DIR, direction ? HIGH : LOW);
-        delay(DIR_SETTLE);
+        delayMicroseconds(DIR_SETTLE_US);   // brief settle; pulses keep flowing
 
         armed     = direction ? ARM_RIGHT : ARM_LEFT;
         reversing = false;
 
         Serial.println(direction ? "-> CW" : "<- CCW");
 
-        // Ramp back up to the user's target speed
-        if (targetSpeedUser > 0) beginRamp(targetSpeedUser);
+        if (targetSpeedUser > 0)
+        {
+            beginRamp(targetSpeedUser);
+        }
     }
 
-    // Refresh STEP pulse interval from currentSpeed
+    // ---- STEP INTERVAL ----------------------------------------------------
     stepIntervalUs = (currentSpeed < 1) ? 999999 : (1000000.0f / currentSpeed);
 }
 
@@ -440,27 +516,32 @@ void stepPulse()
 // ============================================================================
 //
 //   • Only the armed sensor is checked.
-//   • When it trips, we begin a ramp-to-zero (decel) and flag reversing.
+//   • On trip, begin a decel ramp toward the proportional reversal speed
+//     (not zero) and raise the reversing flag.
 //   • handleRamp() finishes the reversal (flip DIR, swap armed sensor,
-//     ramp back up to user target).
-//   • While reversing == true, this function is muted so the just-tripped
+//     ramp back up).
+//   • While reversing == true, this function is muted — the just-tripped
 //     magnet can't double-trigger us.
 //
 void checkSensors()
 {
     if (reversing) return;
-    if (currentSpeed <= 0) return;       // nothing to trip on if we're stopped
+    if (currentSpeed <= 0) return;       // nothing to trip on if stopped
 
     if (armed == ARM_LEFT && digitalRead(HALL_LEFT) == LOW)
     {
         reversing = true;
-        beginRamp(0);
-        Serial.println("LEFT trip");
+        beginRamp(computeReversalHz(currentSpeed));
+        Serial.print("LEFT trip → reversal at ");
+        Serial.print (rampToHz);
+        Serial.println(" Hz");
     }
     else if (armed == ARM_RIGHT && digitalRead(HALL_RIGHT) == LOW)
     {
         reversing = true;
-        beginRamp(0);
-        Serial.println("RIGHT trip");
+        beginRamp(computeReversalHz(currentSpeed));
+        Serial.print("RIGHT trip → reversal at ");
+        Serial.print (rampToHz);
+        Serial.println(" Hz");
     }
 }
